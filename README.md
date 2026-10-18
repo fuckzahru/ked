@@ -21,7 +21,7 @@ A small terminal text editor with syntax highlighting, written in Python with `c
 - Status bar with filename, dirty marker, language, and cursor position
 - Works with new files: opening a non-existent path starts an empty buffer
 
-Requirements
+## Requirements
 - Python 3.8 or newer
 - curses module
 **Linux/macOS: usually included with Python**
