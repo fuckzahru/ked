@@ -1,693 +1,611 @@
 #!/usr/bin/env python3
 """
-ked installer - downloads the latest ked from GitHub and puts it on your PATH.
+ked - a cross-platform terminal text editor with syntax highlighting.
+
+Requires:
+    python -m pip install prompt_toolkit pygments
 
 Usage:
-    python install.py                Download and install the latest ked
-    python install.py --force        Overwrite an existing install
-    python install.py --local        Use a local ked.py instead of downloading
-    python install.py --branch NAME  Download from a specific branch (default: main)
-    python install.py --no-path      Skip adding the install dir to PATH
-    python install.py --uninstall    Remove ked and its PATH entry
-    python install.py --keep-path    With --uninstall, leave PATH untouched
-    python install.py --system       Install system-wide (Unix, may need sudo)
-    python install.py --prefix DIR   Use a custom install directory
-    python install.py --check        Verify Python, deps, install, and PATH
-    python install.py --help         Show this help
+    python ked.py [options] [file]
 
-Default install locations:
-    Linux/macOS   ~/.local/bin/ked
-    Windows       %LOCALAPPDATA%\\Programs\\ked\\ked.py + ked.cmd
+Options:
+    -l, --lang NAME   force a language
+    -h, --help        show help
 
-Runtime dependencies (installed automatically if missing):
-    prompt_toolkit, pygments
+Key bindings:
+    File
+        Ctrl+S        Save
+        F2            Save as
+        Ctrl+O        Open file
+        Ctrl+Q        Quit
+
+    Edit
+        Ctrl+Z        Undo
+        Ctrl+Y        Redo
+        Ctrl+A        Select all
+        Ctrl+C        Copy selection
+        Ctrl+X        Cut selection
+        Ctrl+V        Paste
+        Ctrl+D        Duplicate current line
+        Alt+K         Delete current line (or selection)
+        Alt+Up        Move current line up
+        Alt+Down      Move current line down
+        Tab           Indent (4 spaces)
+        Shift+Tab     Unindent (up to 4 spaces)
+        Enter         New line with auto-indent
+
+    Navigation
+        Ctrl+F        Find
+        F3            Find next
+        Ctrl+G        Go to line
+        Ctrl+L        Go to line
+        Ctrl+Home     Start of file
+        Ctrl+End      End of file
+        Shift+Arrows  Select
+        Ctrl+Arrows   Move by word
+
+    Help
+        F1            Show this help
 """
 
-import os
 import sys
-import stat
-import subprocess
-import importlib
-import urllib.request
-import urllib.error
 from pathlib import Path
 
-MIN_PY = (3, 8)
-INSTALL_NAME = "ked"
-RUNTIME_DEPS = [
-    ("prompt_toolkit", "prompt_toolkit"),
-    ("pygments", "Pygments"),
-]
+try:
+    from prompt_toolkit import Application
+    from prompt_toolkit.application import run_in_terminal, get_app
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import HSplit, Layout, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.lexers import PygmentsLexer
+    from prompt_toolkit.styles import Style, merge_styles
+    from prompt_toolkit.widgets import TextArea
+except ImportError:
+    print("Error: prompt_toolkit is required.", file=sys.stderr)
+    print("Install it with:", file=sys.stderr)
+    print("  python -m pip install prompt_toolkit", file=sys.stderr)
+    sys.exit(1)
 
-DEFAULT_BRANCH = "main"
-GITHUB_RAW = "https://raw.githubusercontent.com/fuckzahru/ked/{branch}/ked.py"
-SHEBANG = b"#!/usr/bin/env python3\n"
-
-
-# --------------------------------------------------------------------------
-# Environment helpers
-# --------------------------------------------------------------------------
-
-def is_windows():
-    return os.name == "nt"
-
-
-def source_path():
-    return Path(__file__).resolve().parent / "ked.py"
-
-
-def default_install_dir(system=False, prefix=None):
-    if prefix:
-        return Path(prefix).expanduser().resolve()
-    if system:
-        if is_windows():
-            base = os.environ.get("ProgramFiles", r"C:\Program Files")
-            return Path(base) / "ked"
-        return Path("/usr/local/bin")
-    if is_windows():
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(
-            "~/AppData/Local"
-        )
-        return Path(base) / "Programs" / "ked"
-    return Path.home() / ".local" / "bin"
+try:
+    from pygments.lexers import get_lexer_by_name, get_lexer_for_filename
+    from pygments.util import ClassNotFound
+    from pygments.styles import get_style_by_name
+    from prompt_toolkit.styles.pygments import style_from_pygments_cls
+    HAVE_PYGMENTS = True
+except ImportError:
+    HAVE_PYGMENTS = False
 
 
-def is_in_path(directory):
-    try:
-        d = Path(directory).resolve()
-    except OSError:
-        return False
-    for entry in os.environ.get("PATH", "").split(os.pathsep):
-        if not entry:
-            continue
+LANG_BY_EXT = {
+    "py": "python", "pyw": "python", "pyi": "python",
+    "js": "javascript", "mjs": "javascript", "cjs": "javascript", "jsx": "jsx",
+    "ts": "typescript", "tsx": "tsx",
+    "c": "c", "h": "c",
+    "cpp": "cpp", "cc": "cpp", "cxx": "cpp",
+    "hpp": "cpp", "hxx": "cpp", "hh": "cpp",
+    "rs": "rust", "go": "go", "java": "java",
+    "rb": "ruby", "php": "php", "pl": "perl", "lua": "lua",
+    "sh": "bash", "bash": "bash", "zsh": "bash", "fish": "fish",
+    "json": "json", "jsonc": "json",
+    "yaml": "yaml", "yml": "yaml", "toml": "toml", "ini": "ini",
+    "html": "html", "htm": "html", "xml": "xml", "svg": "xml", "vue": "vue",
+    "css": "css", "scss": "scss", "sass": "sass", "less": "less",
+    "sql": "sql",
+    "md": "markdown", "markdown": "markdown", "rst": "rst", "tex": "latex",
+    "cs": "csharp", "swift": "swift", "kt": "kotlin", "kts": "kotlin",
+    "scala": "scala", "hs": "haskell", "ml": "ocaml",
+    "ex": "elixir", "exs": "elixir", "erl": "erlang", "clj": "clojure",
+    "r": "r", "dart": "dart", "zig": "zig", "nim": "nim",
+}
+
+LANG_ALIASES = {
+    "python": "python", "py": "python",
+    "javascript": "javascript", "js": "javascript",
+    "typescript": "typescript", "ts": "typescript",
+    "c": "c", "cpp": "cpp", "c++": "cpp", "cxx": "cpp",
+    "rust": "rust", "rs": "rust",
+    "go": "go", "java": "java",
+    "ruby": "ruby", "rb": "ruby", "php": "php", "perl": "perl", "lua": "lua",
+    "shell": "bash", "bash": "bash", "sh": "bash", "zsh": "bash",
+    "json": "json", "yaml": "yaml", "yml": "yaml", "toml": "toml", "ini": "ini",
+    "html": "html", "xml": "xml",
+    "css": "css", "scss": "scss", "sass": "sass", "less": "less",
+    "sql": "sql",
+    "markdown": "markdown", "md": "markdown", "rst": "rst",
+    "latex": "latex", "tex": "latex",
+    "csharp": "csharp", "cs": "csharp", "swift": "swift",
+    "kotlin": "kotlin", "kt": "kotlin", "scala": "scala",
+    "haskell": "haskell", "hs": "haskell", "ocaml": "ocaml", "ml": "ocaml",
+    "elixir": "elixir", "erlang": "erlang", "clojure": "clojure",
+    "r": "r", "dart": "dart", "zig": "zig", "nim": "nim",
+    "text": "text", "plain": "text", "txt": "text",
+}
+
+
+def detect_lexer(path, first_line, lang_name=None):
+    if not HAVE_PYGMENTS:
+        return None
+    if lang_name:
+        name = LANG_ALIASES.get(lang_name.lower(), lang_name.lower())
         try:
-            if Path(entry).resolve() == d:
-                return True
-        except OSError:
-            continue
-    return False
-
-
-def is_in_user_path_windows(directory):
-    """Check HKCU\\Environment Path (the User PATH), not the live env."""
-    try:
-        import winreg
-    except ImportError:
-        return False
-    d = os.path.normcase(str(Path(directory).resolve()))
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment"):
+            return get_lexer_by_name(name)
+        except ClassNotFound:
+            return None
+    if path:
+        ext = Path(path).suffix.lower().lstrip(".")
+        if ext in LANG_BY_EXT:
             try:
-                current, _ = winreg.QueryValueEx(
-                    winreg.QueryValue(""), "Path"
+                return get_lexer_by_name(LANG_BY_EXT[ext])
+            except ClassNotFound:
+                pass
+        try:
+            return get_lexer_for_filename(path)
+        except ClassNotFound:
+            pass
+    if first_line.startswith("#!"):
+        for token in first_line[2:].split():
+            token = token.split("/")[-1]
+            alias = LANG_ALIASES.get(token)
+            if alias:
+                try:
+                    return get_lexer_by_name(alias)
+                except ClassNotFound:
+                    pass
+    return None
+
+
+HELP_TEXT = (
+    "Ctrl+S save  F2 save-as  Ctrl+O open  Ctrl+Q quit | "
+    "Ctrl+Z undo  Ctrl+Y redo | "
+    "Ctrl+A select-all  Ctrl+C copy  Ctrl+X cut  Ctrl+V paste | "
+    "Ctrl+D duplicate  Alt+K delete line  Alt+Up/Down move line | "
+    "Ctrl+F find  F3 find-next  Ctrl+G/Ctrl+L goto | "
+    "Tab indent  Shift+Tab unindent"
+)
+
+
+class KedApp:
+    def __init__(self, path=None, lang_name=None):
+        self.path = None
+        self.dirty = False
+        self.search_query = ""
+        content = ""
+        first_line = ""
+
+        if path:
+            p = Path(path).expanduser()
+            self.path = str(p.resolve())
+            if p.exists():
+                try:
+                    content = p.read_text(encoding="utf-8", errors="replace")
+                    content = content.replace("\r\n", "\n").replace("\r", "\n")
+                except OSError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    sys.exit(1)
+                if content:
+                    first_line = content.split("\n", 1)[0]
+
+        lexer = detect_lexer(self.path, first_line, lang_name)
+
+        self.text_area = TextArea(
+            text=content,
+            scrollbar=True,
+            line_numbers=True,
+            wrap_lines=False,
+            multiline=True,
+            focusable=True,
+            lexer=PygmentsLexer(lexer.__class__) if lexer else None,
+        )
+        self.text_area.buffer.on_text_changed += self._mark_dirty
+
+        self.message = "F1 help  Ctrl+S save  Ctrl+Q quit"
+        self.message_bar = Window(
+            FormattedTextControl(lambda: [("class:msg", f" {self.message}")]),
+            height=1,
+            style="class:msgbar",
+        )
+        self.status_bar = Window(
+            FormattedTextControl(self._status_text),
+            height=1,
+            style="class:status",
+        )
+
+        self.kb = KeyBindings()
+        self._setup_keybindings()
+
+        base_style = Style.from_dict({
+            "status": "reverse",
+            "msg":    "fg:#ffd75f",
+            "msgbar": "bg:#333333",
+        })
+        if HAVE_PYGMENTS:
+            try:
+                self.style = merge_styles(
+                    [base_style, style_from_pygments_cls(get_style_by_name("monokai"))]
                 )
-            except (FileNotFoundError, OSError):
-                return False
-    except OSError:
-        return False
-    for entry in current.split(";"):
-        entry = entry.strip()
-        if not entry:
-            continue
-        expanded = os.path.expandvars(entry)
-        if os.path.normcase(expanded) == d:
-            return True
-    return False
-
-
-# --------------------------------------------------------------------------
-# Download
-# --------------------------------------------------------------------------
-
-def download_ked(branch=DEFAULT_BRANCH):
-    """Fetch ked.py from GitHub. Returns bytes or None on failure."""
-    url = GITHUB_RAW.format(branch=branch)
-    print(f"Downloading {url}")
-    try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            data = resp.read()
-    except urllib.error.HTTPError as e:
-        print(f"Error: HTTP {e.code} for {url}")
-        if e.code == 404:
-            print(f"Check the branch name (--branch) — '{branch}' may "
-                  f"not exist.")
-        return None
-    except urllib.error.URLError as e:
-        print(f"Error: cannot reach GitHub: {e.reason}")
-        return None
-    except Exception as e:
-        print(f"Error downloading: {e}")
-        return None
-
-    if not is_windows() and not data.startswith(b"#!"):
-        data = SHEBANG + data
-    return data
-
-
-def write_file(dest, data):
-    try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(data)
-        return True
-    except PermissionError:
-        print(f"Error: permission denied writing to {dest}")
-        return False
-    except OSError as e:
-        print(f"Error writing {dest}: {e}")
-        return False
-
-
-# --------------------------------------------------------------------------
-# PATH modification
-# --------------------------------------------------------------------------
-
-def _broadcast_env_change():
-    try:
-        import ctypes
-        HWND_BROADCAST = 0xFFFF
-        WM_SETTINGCHANGE = 0x001A
-        SMTO_ABORTIFHUNG = 0x0002
-        result = ctypes.c_ulong()
-        ctypes.windll.user32.SendMessageTimeoutW(
-            HWND_BROADCAST, WM_SETTINGCHANGE, 0,
-            "Environment", SMTO_ABORTIFHUNG, 5000,
-            ctypes.byref(result),
-        )
-    except Exception:
-        pass
-
-
-def _add_to_user_path_windows(directory):
-    import winreg
-    d = str(Path(directory).resolve())
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, "Environment", 0,
-            winreg.KEY_READ | winreg.KEY_WRITE,
-        ) as key:
-            try:
-                current, kind = winreg.QueryValueEx(key, "Path")
-            except FileNotFoundError:
-                current, kind = "", winreg.REG_EXPAND_SZ
-
-            entries = [e for e in current.split(";") if e]
-            for e in entries:
-                if os.path.normcase(os.path.expandvars(e)) == os.path.normcase(d):
-                    return "already"
-
-            new_path = ";".join(entries + [d])
-            if kind not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
-                kind = winreg.REG_EXPAND_SZ
-            winreg.SetValueEx(key, "Path", 0, kind, new_path)
-    except OSError as e:
-        return f"error: {e}"
-
-    _broadcast_env_change()
-    return "added"
-
-
-def _remove_from_user_path_windows(directory):
-    import winreg
-    d = os.path.normcase(str(Path(directory).resolve()))
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, "Environment", 0,
-            winreg.KEY_READ | winreg.KEY_WRITE,
-        ) as key:
-            try:
-                current, kind = winreg.QueryValueEx(key, "Path")
-            except FileNotFoundError:
-                return "not-present"
-
-            entries = [e for e in current.split(";") if e]
-            kept = []
-            found = False
-            for e in entries:
-                if os.path.normcase(os.path.expandvars(e)) == d:
-                    found = True
-                    continue
-                kept.append(e)
-
-            if not found:
-                return "not-present"
-
-            new_path = ";".join(kept)
-            if kind not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
-                kind = winreg.REG_EXPAND_SZ
-            winreg.SetValueEx(key, "Path", 0, kind, new_path)
-    except OSError as e:
-        return f"error: {e}"
-
-    _broadcast_env_change()
-    return "removed"
-
-
-def _shell_rc_path():
-    shell = os.environ.get("SHELL", "")
-    if "fish" in shell:
-        return Path.home() / ".config" / "fish" / "config.fish"
-    return Path.home() / (".zshrc" if "zsh" in shell else ".bashrc")
-
-
-def _add_to_user_path_unix(directory):
-    d = str(Path(directory).resolve())
-    shell = os.environ.get("SHELL", "")
-    rc = _shell_rc_path()
-
-    if "fish" in shell:
-        line = f"fish_add_path {d}\n"
-    else:
-        line = f'export PATH="{d}:$PATH"\n'
-
-    try:
-        existing = rc.read_text(encoding="utf-8") if rc.exists() else ""
-    except OSError:
-        existing = ""
-
-    if d in existing:
-        return "already"
-
-    try:
-        rc.parent.mkdir(parents=True, exist_ok=True)
-        with rc.open("a", encoding="utf-8") as f:
-            if existing and not existing.endswith("\n"):
-                f.write("\n")
-            f.write("# added by ked installer\n")
-            f.write(line)
-    except OSError as e:
-        return f"error: {e}"
-
-    return "added"
-
-
-def _remove_from_user_path_unix(directory):
-    d = str(Path(directory).resolve())
-    rc = _shell_rc_path()
-    if not rc.exists():
-        return "not-present"
-
-    try:
-        lines = rc.read_text(encoding="utf-8").splitlines(keepends=True)
-    except OSError as e:
-        return f"error: {e}"
-
-    kept = []
-    removed = False
-    prev_was_marker = False
-    for line in lines:
-        stripped = line.strip()
-        is_marker = stripped == "# added by ked installer"
-        is_entry = (
-            f'export PATH="{d}:' in line
-            or f"fish_add_path {d}" in line
-        )
-        if is_entry:
-            removed = True
-            if prev_was_marker and kept:
-                kept.pop()
-            prev_was_marker = False
-            continue
-        kept.append(line)
-        prev_was_marker = is_marker
-
-    if not removed:
-        return "not-present"
-
-    try:
-        rc.write_text("".join(kept), encoding="utf-8")
-    except OSError as e:
-        return f"error: {e}"
-
-    return "removed"
-
-
-def add_to_user_path(directory):
-    if is_windows():
-        return _add_to_user_path_windows(directory)
-    return _add_to_user_path_unix(directory)
-
-
-def remove_from_user_path(directory):
-    if is_windows():
-        return _remove_from_user_path_windows(directory)
-    return _remove_from_user_path_unix(directory)
-
-
-def print_manual_path_hint(directory):
-    d = str(directory)
-    if is_windows():
-        print("Add it to your user PATH with PowerShell:")
-        print(f'  [Environment]::SetEnvironmentVariable('
-              f'"Path", $env:Path + ";{d}", "User")')
-        return
-    shell = os.environ.get("SHELL", "")
-    if "fish" in shell:
-        print(f"  fish_add_path {d}")
-        return
-    print(f'Add this line to {_shell_rc_path()}:')
-    print(f'  export PATH="{d}:$PATH"')
-
-
-# --------------------------------------------------------------------------
-# Requirements
-# --------------------------------------------------------------------------
-
-def check_python():
-    if sys.version_info < MIN_PY:
-        print(f"Error: Python {MIN_PY[0]}.{MIN_PY[1]}+ is required. "
-              f"Found {sys.version.split()[0]}.")
-        return False
-    return True
-
-
-def check_runtime_deps(verbose=True):
-    missing = []
-    for mod, pkg in RUNTIME_DEPS:
-        try:
-            importlib.import_module(mod)
-        except ImportError:
-            missing.append(pkg)
-    if verbose:
-        if missing:
-            print("Missing runtime dependencies: " + ", ".join(missing))
+            except Exception:
+                self.style = base_style
         else:
-            print("Runtime dependencies OK: " +
-                  ", ".join(p for _, p in RUNTIME_DEPS))
-    return missing
+            self.style = base_style
 
+        body = HSplit([self.text_area, self.status_bar, self.message_bar])
+        self.app = Application(
+            layout=Layout(body, focused_element=self.text_area),
+            key_bindings=self.kb,
+            style=self.style,
+            full_screen=True,
+            mouse_support=True,
+        )
 
-def ensure_runtime_deps():
-    missing = check_runtime_deps(verbose=False)
-    if not missing:
-        return True
+    # -- state ------------------------------------------------------------
+    def _mark_dirty(self, _buf):
+        self.dirty = True
 
-    print("Installing runtime dependencies: " + ", ".join(missing))
-    base = [sys.executable, "-m", "pip", "install", "--upgrade"]
-    attempts = [
-        base + missing,
-        base + ["--user"] + missing,  # PEP 668 / read-only site-packages
-    ]
-    last_err = None
-    for cmd in attempts:
+    def _status_text(self):
         try:
-            subprocess.check_call(cmd)
-            return True
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            last_err = e
+            doc = self.text_area.buffer.document
+            row = doc.cursor_position_row + 1
+            col = doc.cursor_position_col + 1
+        except Exception:
+            row, col = 1, 1
+        name = Path(self.path).name if self.path else "[No Name]"
+        sel = " [SEL]" if self.text_area.buffer.selection_state else ""
+        return (
+            f" {name}{' [+]' if self.dirty else ''}{sel}   "
+            f"Ln {row}, Col {col}"
+        )
 
-    print("Automatic install failed.", file=sys.stderr)
-    print("Install manually:", file=sys.stderr)
-    print(f"  {sys.executable} -m pip install {' '.join(missing)}",
-          file=sys.stderr)
-    if last_err:
-        print(f"Last error: {last_err}", file=sys.stderr)
-    print("If your system blocks pip (PEP 668), create a virtual "
-          "environment and install ked there.", file=sys.stderr)
-    return False
+    def _set_message(self, text):
+        self.message = text
+        try:
+            self.app.invalidate()
+        except Exception:
+            pass
 
+    # -- keybindings ------------------------------------------------------
+    def _setup_keybindings(self):
+        kb = self.kb
 
-# --------------------------------------------------------------------------
-# Install / uninstall
-# --------------------------------------------------------------------------
+        # --- File ----------------------------------------------------------
+        @kb.add("c-s")
+        def _save(event):
+            self.save()
 
-def ensure_dir(directory):
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        return True
-    except PermissionError:
-        return False
+        @kb.add("f2")
+        def _save_as(event):
+            self._prompt("Save as: ", self._do_save)
 
+        @kb.add("c-o")
+        def _open(event):
+            self._prompt("Open: ", self.open_file)
 
-def install(system=False, prefix=None, force=False, add_path=True,
-            local=False, branch=DEFAULT_BRANCH):
-    if not check_python():
-        return 1
-
-    if not ensure_runtime_deps():
-        print("Continuing anyway; ked will warn about missing modules at "
-              "startup.", file=sys.stderr)
-
-    install_dir = default_install_dir(system=system, prefix=prefix)
-
-    if not ensure_dir(install_dir):
-        print(f"Error: cannot create {install_dir} (permission denied)")
-        if not system and not is_windows():
-            print("Try: sudo python3 install.py --system")
-        return 1
-
-    # ---- obtain ked.py --------------------------------------------------
-    if local:
-        src = source_path()
-        if not src.is_file():
-            print(f"Error: --local requested but {src} does not exist.")
-            print("Run install.py from the same directory as ked.py, "
-                  "or omit --local to download from GitHub.")
-            return 1
-        print(f"Using local file: {src}")
-        data = src.read_bytes()
-        if not is_windows() and not data.startswith(b"#!"):
-            data = SHEBANG + data
-    else:
-        data = download_ked(branch=branch)
-        if data is None:
-            src = source_path()
-            if src.is_file():
-                print(f"Download failed. Falling back to local file: {src}")
-                data = src.read_bytes()
-                if not is_windows() and not data.startswith(b"#!"):
-                    data = SHEBANG + data
+        @kb.add("c-q")
+        def _quit(event):
+            if self.dirty:
+                self._prompt("Save before quit? (y/n): ", self._handle_quit)
             else:
-                print("No local ked.py to fall back to. Install aborted.")
-                return 1
+                event.app.exit()
 
-    # ---- install --------------------------------------------------------
-    if is_windows():
-        target_script = install_dir / "ked.py"
-        target_wrapper = install_dir / "ked.cmd"
+        @kb.add("f1")
+        def _help(event):
+            self._set_message(HELP_TEXT)
 
-        if target_script.exists() and not force:
-            print(f"ked is already installed at {target_script}")
-            print("Use --force to overwrite.")
-            return 1
+        # --- Edit history --------------------------------------------------
+        @kb.add("c-z")
+        def _undo(event):
+            event.current_buffer.undo()
 
-        if not write_file(target_script, data):
-            return 1
+        @kb.add("c-y")
+        def _redo(event):
+            event.current_buffer.redo()
 
-        try:
-            wrapper = (
-                "@echo off\r\n"
-                f'"{sys.executable}" "%~dp0ked.py" %*\r\n'
-            )
-            target_wrapper.write_text(wrapper, encoding="utf-8", newline="")
-        except PermissionError:
-            print(f"Error: permission denied writing to {target_wrapper}")
-            return 1
+        # --- Selection -----------------------------------------------------
+        @kb.add("c-a", eager=True)
+        def _select_all(event):
+            buf = event.current_buffer
+            buf.cursor_position = 0
+            buf.start_selection()
+            buf.cursor_position = len(buf.text)
+            self._set_message("Selected all")
 
-        print(f"Installed: {target_script}")
-        print(f"Wrapper:   {target_wrapper}")
-    else:
-        target = install_dir / INSTALL_NAME
+        @kb.add("c-c", eager=True)
+        def _copy(event):
+            buf = event.current_buffer
+            if not buf.selection_state:
+                self._set_message("No selection (Ctrl+A to select all)")
+                return
+            data = buf.copy_selection()
+            if data and data.text:
+                self._set_message(f"Copied {len(data.text)} chars")
+            else:
+                self._set_message("Nothing to copy")
 
-        if target.exists() and not force:
-            print(f"ked is already installed at {target}")
-            print("Use --force to overwrite.")
-            return 1
+        @kb.add("c-x", eager=True)
+        def _cut(event):
+            buf = event.current_buffer
+            if not buf.selection_state:
+                self._set_message("No selection")
+                return
+            data = buf.cut_selection()
+            if data and data.text:
+                self._set_message(f"Cut {len(data.text)} chars")
+            else:
+                self._set_message("Nothing to cut")
 
-        if not write_file(target, data):
-            return 1
-
-        try:
-            st = target.stat()
-            os.chmod(
-                target,
-                st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,
-            )
-        except PermissionError:
-            print(f"Warning: could not make {target} executable.")
-            print("Try: chmod +x " + str(target))
-
-        print(f"Installed: {target}")
-
-    # ---- PATH handling --------------------------------------------------
-    if is_in_path(install_dir):
-        print(f"\n{install_dir} is already on PATH for this terminal.")
-    elif system:
-        print(f"\n{install_dir} is not on your PATH.")
-        print_manual_path_hint(install_dir)
-    elif add_path:
-        result = add_to_user_path(install_dir)
-        if result == "added":
-            print(f"\nAdded {install_dir} to your user PATH.")
-            print("Close and reopen your terminal for 'ked' to be found.")
-        elif result == "already":
-            print(f"\n{install_dir} was already in your user PATH.")
-            print("Close and reopen your terminal if 'ked' isn't found.")
-        else:
-            print(f"\nCould not update PATH ({result}).")
-            print_manual_path_hint(install_dir)
-    else:
-        print(f"\nSkipped PATH update (--no-path). "
-              f"{install_dir} is not on PATH.")
-        print_manual_path_hint(install_dir)
-
-    print(f"\nWrapper interpreter: {sys.executable}")
-    print("If you upgrade or move Python, re-run install.py.")
-    return 0
-
-
-def uninstall(system=False, prefix=None, remove_path=True):
-    install_dir = default_install_dir(system=system, prefix=prefix)
-    names = ["ked.py", "ked.cmd"] if is_windows() else [INSTALL_NAME]
-
-    removed = []
-    for name in names:
-        p = install_dir / name
-        if p.exists():
+        @kb.add("c-v", eager=True)
+        def _paste(event):
+            buf = event.current_buffer
             try:
-                p.unlink()
-                removed.append(p)
-            except PermissionError:
-                print(f"Error: cannot remove {p}")
-                if not system and not is_windows():
-                    print("Try: sudo python3 install.py --uninstall --system")
-                return 1
+                data = get_app().clipboard.get_data()
+            except Exception:
+                data = None
+            if not data or not data.text:
+                self._set_message("Clipboard empty")
+                return
+            buf.paste_clipboard_data(data)
+            self._set_message(f"Pasted {len(data.text)} chars")
 
-    if not removed:
-        print(f"ked is not installed in {install_dir}")
-        return 1
-
-    for p in removed:
-        print(f"Removed {p}")
-
-    try:
-        install_dir.rmdir()
-        print(f"Removed empty directory {install_dir}")
-    except OSError:
-        pass
-
-    if not remove_path:
-        print("Skipped PATH cleanup (--keep-path).")
-    elif system:
-        print(f"Note: {install_dir} was left in the system PATH.")
-        print("Remove it manually if you added it.")
-    else:
-        result = remove_from_user_path(install_dir)
-        if result == "removed":
-            print(f"Removed {install_dir} from your user PATH.")
-            print("Close and reopen your terminal for the change to apply.")
-        elif result == "not-present":
-            print(f"{install_dir} was not in your user PATH.")
-        else:
-            print(f"Could not update PATH ({result}).")
-            print_manual_path_hint(install_dir)
-
-    print("\nRuntime dependencies (prompt_toolkit, pygments) were left "
-          "installed.")
-    print("To remove them: "
-          f"{sys.executable} -m pip uninstall prompt_toolkit pygments")
-    return 0
-
-
-# --------------------------------------------------------------------------
-# Check mode
-# --------------------------------------------------------------------------
-
-def check():
-    ok = True
-    print(f"Python: {sys.version.split()[0]}  ({sys.executable})")
-    if sys.version_info < MIN_PY:
-        print(f"  ERROR: need Python {MIN_PY[0]}.{MIN_PY[1]}+")
-        ok = False
-
-    missing = check_runtime_deps(verbose=False)
-    if missing:
-        print("Runtime dependencies:")
-        for _, pkg in RUNTIME_DEPS:
-            print(f"  {pkg}: {'MISSING' if pkg in missing else 'OK'}")
-        ok = False
-    else:
-        print("Runtime dependencies: OK ("
-              + ", ".join(p for _, p in RUNTIME_DEPS) + ")")
-
-    install_dir = default_install_dir()
-    target = install_dir / ("ked.py" if is_windows() else INSTALL_NAME)
-    print(f"Install directory: {install_dir}")
-    installed = target.exists()
-    print(f"Installed: {'yes' if installed else 'no'}")
-
-    live = is_in_path(install_dir)
-    if is_windows():
-        persisted = is_in_user_path_windows(install_dir)
-    else:
-        rc = _shell_rc_path()
-        persisted = (
-            rc.exists()
-            and str(install_dir) in rc.read_text(
-                encoding="utf-8", errors="replace"
+        # --- Line manipulation ---------------------------------------------
+        @kb.add("c-d", eager=True)
+        def _duplicate(event):
+            buf = event.current_buffer
+            doc = buf.document
+            row = doc.cursor_position_row
+            col = doc.cursor_position_col
+            lines = doc.lines
+            if row >= len(lines):
+                return
+            line_text = lines[row]
+            end_idx = doc.translate_row_col_to_index(row, len(line_text))
+            buf.cursor_position = end_idx
+            buf.insert_text("\n" + line_text)
+            buf.cursor_position = buf.document.translate_row_col_to_index(
+                row + 1, min(col, len(line_text))
             )
+            self._set_message("Duplicated line")
+
+        @kb.add("escape", "k")
+        def _delete_line(event):
+            buf = event.current_buffer
+            if buf.selection_state:
+                data = buf.cut_selection()
+                if data and data.text:
+                    self._set_message("Deleted selection")
+                return
+            doc = buf.document
+            row = doc.cursor_position_row
+            lines = list(doc.lines)
+            if len(lines) <= 1:
+                buf.text = ""
+                self._set_message("Cleared buffer")
+                return
+            del lines[row]
+            buf.text = "\n".join(lines)
+            new_row = min(row, len(lines) - 1)
+            buf.cursor_position = buf.document.translate_row_col_to_index(
+                new_row, 0
+            )
+            self._set_message("Deleted line")
+
+        @kb.add("escape", "up")
+        def _move_up(event):
+            buf = event.current_buffer
+            doc = buf.document
+            row = doc.cursor_position_row
+            if row == 0:
+                return
+            col = doc.cursor_position_col
+            lines = list(doc.lines)
+            lines[row - 1], lines[row] = lines[row], lines[row - 1]
+            buf.text = "\n".join(lines)
+            buf.cursor_position = buf.document.translate_row_col_to_index(
+                row - 1, min(col, len(lines[row - 1]))
+            )
+            self._set_message("Moved line up")
+
+        @kb.add("escape", "down")
+        def _move_down(event):
+            buf = event.current_buffer
+            doc = buf.document
+            row = doc.cursor_position_row
+            lines = list(doc.lines)
+            if row >= len(lines) - 1:
+                return
+            col = doc.cursor_position_col
+            lines[row + 1], lines[row] = lines[row], lines[row + 1]
+            buf.text = "\n".join(lines)
+            buf.cursor_position = buf.document.translate_row_col_to_index(
+                row + 1, min(col, len(lines[row + 1]))
+            )
+            self._set_message("Moved line down")
+
+        @kb.add("tab")
+        def _indent(event):
+            event.current_buffer.insert_text("    ")
+
+        @kb.add("s-tab")
+        def _unindent(event):
+            buf = event.current_buffer
+            doc = buf.document
+            row = doc.cursor_position_row
+            line = doc.lines[row]
+            if line.startswith("    "):
+                remove = 4
+            elif line.startswith("  "):
+                remove = 2
+            elif line.startswith(" ") or line.startswith("\t"):
+                remove = 1
+            else:
+                return
+            start = doc.translate_row_col_to_index(row, 0)
+            buf.cursor_position = start
+            buf.delete(count=remove)
+
+        @kb.add("enter")
+        def _enter(event):
+            buf = event.current_buffer
+            if buf is not self.text_area.buffer:
+                buf.insert_text("\n")
+                return
+            line = buf.document.current_line
+            indent = line[: len(line) - len(line.lstrip())]
+            if line.rstrip().endswith(":"):
+                indent += "    "
+            buf.insert_text("\n" + indent)
+
+        # --- Search --------------------------------------------------------
+        @kb.add("c-f")
+        def _find(event):
+            self._prompt("Find: ", self.do_find)
+
+        @kb.add("f3")
+        def _find_next(event):
+            self.find_next()
+
+        @kb.add("c-g")
+        def _goto(event):
+            self._prompt("Go to line: ", self.do_goto)
+
+        @kb.add("c-l")
+        def _goto2(event):
+            self._prompt("Go to line: ", self.do_goto)
+
+    # -- prompting --------------------------------------------------------
+    def _prompt(self, label, callback):
+        async def do_prompt():
+            try:
+                result = await run_in_terminal(lambda: input(label))
+                callback(result)
+            except (KeyboardInterrupt, EOFError):
+                pass
+        self.app.create_background_task(do_prompt())
+
+    def _handle_quit(self, text):
+        t = text.strip().lower()
+        if t == "y":
+            if self.path:
+                self._do_save(self.path)
+                if not self.dirty:
+                    self.app.exit()
+            else:
+                self._prompt("Save as: ", self._do_save_and_quit)
+        elif t == "n":
+            self.app.exit()
+
+    def _do_save_and_quit(self, path):
+        self._do_save(path)
+        if not self.dirty:
+            self.app.exit()
+
+    # -- file ops ---------------------------------------------------------
+    def save(self):
+        if not self.path:
+            self._prompt("Save as: ", self._do_save)
+        else:
+            self._do_save(self.path)
+
+    def _do_save(self, path):
+        path = (path or "").strip()
+        if not path:
+            return
+        try:
+            p = Path(path).expanduser()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(self.text_area.text, encoding="utf-8")
+            self.path = str(p.resolve())
+            self.dirty = False
+            self._set_message(f"Saved {p.name}")
+        except OSError as e:
+            self._set_message(f"Save failed: {e}")
+
+    def open_file(self, path):
+        path = (path or "").strip()
+        if not path:
+            return
+        try:
+            p = Path(path).expanduser()
+            content = p.read_text(encoding="utf-8", errors="replace")
+            content = content.replace("\r\n", "\n").replace("\r", "\n")
+            self.text_area.text = content
+            self.path = str(p.resolve())
+            self.dirty = False
+            self._set_message(f"Opened {p.name}")
+        except OSError as e:
+            self._set_message(f"Open failed: {e}")
+
+    # -- find / goto ------------------------------------------------------
+    def do_find(self, text, from_pos=None):
+        text = (text or "").strip()
+        if not text:
+            return
+        self.search_query = text
+        buf = self.text_area.buffer
+        if from_pos is None:
+            from_pos = buf.document.cursor_position
+        idx = buf.text.find(text, from_pos)
+        if idx < 0:
+            idx = buf.text.find(text)  # wrap
+            if idx < 0:
+                self._set_message(f"Not found: {text}")
+                return
+        buf.cursor_position = idx
+        self._set_message(f"Found '{text}'")
+
+    def find_next(self):
+        if not self.search_query:
+            self._prompt("Find: ", self.do_find)
+            return
+        buf = self.text_area.buffer
+        start = buf.document.cursor_position + len(self.search_query)
+        self.do_find(self.search_query, from_pos=start)
+
+    def do_goto(self, text):
+        try:
+            line = int((text or "").strip()) - 1
+        except ValueError:
+            self._set_message("Invalid line number")
+            return
+        doc = self.text_area.buffer.document
+        line = max(0, min(line, doc.line_count - 1))
+        self.text_area.buffer.cursor_position = (
+            doc.translate_row_col_to_index(line, 0)
         )
 
-    print(f"On PATH (current session): {'yes' if live else 'no'}")
-    if not live and persisted:
-        print("On PATH (persisted): yes -- close and reopen your terminal.")
-    elif not live:
-        print("On PATH (persisted): no")
+    # -- run --------------------------------------------------------------
+    def run(self):
+        self.app.run()
 
-    return 0 if ok and installed and live else 1
-
-
-# --------------------------------------------------------------------------
-# Entry point
-# --------------------------------------------------------------------------
 
 def main():
     args = sys.argv[1:]
-
     if "-h" in args or "--help" in args:
         print(__doc__.strip())
-        return 0
+        return
 
-    prefix = None
-    if "--prefix" in args:
-        i = args.index("--prefix")
-        if i + 1 >= len(args):
-            print("Error: --prefix needs a directory")
-            return 2
-        prefix = args[i + 1]
+    path = None
+    lang = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-l", "--lang"):
+            i += 1
+            if i >= len(args):
+                print("Error: -l needs a value", file=sys.stderr)
+                sys.exit(2)
+            lang = args[i]
+        elif not a.startswith("-"):
+            path = a
+        i += 1
 
-    branch = DEFAULT_BRANCH
-    if "--branch" in args:
-        i = args.index("--branch")
-        if i + 1 >= len(args):
-            print("Error: --branch needs a name")
-            return 2
-        branch = args[i + 1]
-
-    system = "--system" in args
-    force = "--force" in args or "-f" in args
-    add_path = "--no-path" not in args
-    local = "--local" in args
-    keep_path = "--keep-path" in args
-
-    if "--check" in args:
-        return check()
-
-    if "--uninstall" in args:
-        return uninstall(
-            system=system,
-            prefix=prefix,
-            remove_path=not keep_path,
+    if not HAVE_PYGMENTS:
+        print(
+            "Note: install pygments for syntax highlighting: "
+            "python -m pip install pygments",
+            file=sys.stderr,
         )
 
-    return install(
-        system=system,
-        prefix=prefix,
-        force=force,
-        add_path=add_path,
-        local=local,
-        branch=branch,
-    )
+    KedApp(path=path, lang_name=lang).run()
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    main()
