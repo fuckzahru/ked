@@ -24,9 +24,9 @@ A small terminal text editor with syntax highlighting, written in Python with `c
 Requirements
 - Python 3.8 or newer
 - curses module
-==Linux/macOS: usually included with Python==
-==Windows: install windows-curses==
+**Linux/macOS: usually included with Python**
+**Windows: install windows-curses**
 
-'python -m pip install windows-curses'
+`python -m pip install windows-curses`
 
 A terminal at least 20 columns wide and 4 rows tall. Smaller terminals show a "Terminal too small" message.
